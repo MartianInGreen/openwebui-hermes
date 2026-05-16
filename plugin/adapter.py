@@ -194,9 +194,15 @@ class OpenWebUIAdapter(BasePlatformAdapter):
             self._http = None
             return False
 
-        # Join channels
+        # Join channels — register channel handlers AFTER auth
         async def join_callback(*args):
-            logger.info("Open WebUI: joined user channels: %s", args[0] if args else "ok")
+            uid = args[0].get("id") if args else None
+            if uid:
+                self._register_channel_handlers(uid)
+            logger.info(
+                "Open WebUI: joined channels (user=%s)",
+                uid or "unknown",
+            )
 
         await self._sio.emit(
             "user-join",
@@ -242,6 +248,7 @@ class OpenWebUIAdapter(BasePlatformAdapter):
     # ── Socket.IO handlers ──
 
     def _register_handlers(self) -> None:
+        """Register basic socket lifecycle handlers before connect."""
         sio = self._sio
 
         @sio.on("connect")
@@ -252,8 +259,27 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         async def on_disconnect():
             logger.info("Open WebUI: socket disconnected")
 
+        # Catch-all: log every event name for debugging
+        @sio.on("*")
+        async def catch_all(event: str, *args):
+            if event not in ("connect", "disconnect", "connect_error"):
+                logger.info("Open WebUI socket event: %s", event)
+
+    def _register_channel_handlers(self, user_id: str) -> None:
+        """
+        Register channel event handlers AFTER user-join.
+
+        This matches the official open-webui/bot pattern — handlers
+        are tied to the authenticated user session.
+        """
+        sio = self._sio
+        bot_id = user_id
+
         @sio.on("channel-events")
         async def on_channel_events(data: dict):
+            # Ignore own events
+            if data.get("user", {}).get("id") == bot_id:
+                return
             await self._handle_channel_event(data)
 
     async def _handle_channel_event(self, data: dict) -> None:
