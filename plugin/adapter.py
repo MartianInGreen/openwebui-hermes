@@ -199,9 +199,14 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         ) as r:
             if r.status >= 400:
                 text = await r.text()
-                logger.error("GET %s → %s: %s", path, r.status, text[:200])
+                logger.warning("GET %s → %s: %s", path, r.status, text[:200])
                 return None
-            return await r.json()
+            try:
+                return await r.json()
+            except Exception:
+                text = await r.text()
+                logger.warning("GET %s → 200 but non-JSON response (%s...)", path, text[:80])
+                return None
 
     async def _ow_post(self, path: str, body: dict = None) -> Any:
         async with self._http.post(
