@@ -195,8 +195,8 @@ class OpenWebUIAdapter(BasePlatformAdapter):
             return False
 
         # Join channels
-        def join_callback(data):
-            logger.debug("Open WebUI: joined user channels: %s", data)
+        async def join_callback(*args):
+            logger.info("Open WebUI: joined user channels: %s", args[0] if args else "ok")
 
         await self._sio.emit(
             "user-join",
