@@ -299,12 +299,12 @@ class OpenWebUIAdapter(BasePlatformAdapter):
     async def _resolve_channel(self) -> Optional[str]:
         name = self.channel_name.strip()
         if name.startswith("ch_"):
-            for prefix in ("/api/v1/channels/", "/api/channels/"):
+            for prefix in ("/v1/channels/", "/channels/"):
                 ch = await self._ow_get(f"{prefix}{name}")
                 if isinstance(ch, dict) and ch.get("id"):
                     return ch["id"]
         # List channels — try both path variants
-        for prefix in ("/api/v1/channels", "/api/channels/"):
+        for prefix in ("/v1/channels", "/channels/"):
             channels = await self._ow_get(prefix)
             if isinstance(channels, list):
                 break
