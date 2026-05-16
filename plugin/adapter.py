@@ -1,16 +1,19 @@
 """
 Open WebUI Channels Platform Adapter for Hermes Agent.
 
-Connects to an Open WebUI instance via its REST API, watches a
-designated channel for new messages, and relays them to the Hermes
-agent for processing.  Messages are independent API calls so users
-can interject mid-response.
+Architecture:
+  Every conversation lives in a channel *thread*.  When a user @mentions
+  the bot in a top-level message, Hermes replies as a thread reply —
+  that thread becomes the session.  Subsequent messages in the thread
+  (no @mention needed) are continuations of that session.
 
-SESSION CONTINUITY: each channel gets a stable Hermes session.
-Conversation history is accumulated in memory and passed to each
-run so the agent remembers what happened before.
+  This gives us:
+  - Clean session boundaries (one thread = one conversation)
+  - Mid-response interjection (new message in the thread → background task)
+  - Natural context grouping (the thread IS the conversation history)
+  - Approval flow via message exchange in the thread
 
-Configuration (config.yaml):
+Config (config.yaml):
     gateway:
       platforms:
         openwebui:
@@ -21,8 +24,10 @@ Configuration (config.yaml):
             channel: "#hermes"
             poll_interval: 3
 
-Or via environment variables:
+Env vars:
     OPENWEBUI_URL, OPENWEBUI_API_KEY, OPENWEBUI_CHANNEL_NAME
+    HERMES_API_URL (default: http://127.0.0.1:8642/v1)
+    HERMES_API_KEY
 """
 
 import asyncio
@@ -44,22 +49,25 @@ from gateway.config import PlatformConfig, Platform
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 3
+BOT_NAME = "hermes"  # Used for @mention detection
 
 
-# ── Per-channel state ──────────────────────────────────────────────────
+# ── Per-thread state ───────────────────────────────────────────────────
 
-class ChannelState:
-    """Tracks conversation history and last-seen message for one channel."""
+class ThreadState:
+    """
+    Session state for one channel thread.
 
-    def __init__(self):
-        # Accumulated conversation for session continuity.
-        # Each entry: {"role": "user"|"assistant", "content": "..."}
+    The thread's parent message ID is the stable key.  History is
+    accumulated here so the Hermes runs get the full conversation.
+    """
+
+    def __init__(self, parent_id: str):
+        self.parent_id: str = parent_id
         self.history: List[Dict[str, str]] = []
-        # Last processed message ID (poll watermark)
-        self.last_message_id: Optional[str] = None
-        # Pending approval run_id
+        self.last_reply_id: Optional[str] = None
+        # Approval flow
         self.pending_run_id: Optional[str] = None
-        # Approval session key for resolving pending approvals
         self.pending_session_key: Optional[str] = None
 
     def add_user_message(self, content: str) -> None:
@@ -69,14 +77,15 @@ class ChannelState:
         self.history.append({"role": "assistant", "content": content})
 
 
-# ── Open WebUI message envelope ────────────────────────────────────────
+# ── Open WebUI message ─────────────────────────────────────────────────
 
 class OWMessage:
-    """Minimal parsed representation of a channel message."""
+    """A message from the Open WebUI Channels API."""
 
     def __init__(self, raw: dict):
         self.id: str = raw.get("id", "")
         self.content: str = raw.get("content", "")
+        self.parent_id: Optional[str] = raw.get("parent_id")  # None = top-level
         self.user_id: str = ""
         self.user_name: str = ""
         self.created_at: int = raw.get("created_at", 0)
@@ -85,26 +94,32 @@ class OWMessage:
             self.user_id = str(user.get("id", ""))
             self.user_name = str(user.get("name", ""))
 
+    def is_top_level(self) -> bool:
+        return not self.parent_id
+
+    def mentions_bot(self, bot_user_id: str) -> bool:
+        """Check if content @mentions the bot user."""
+        if not self.content:
+            return False
+        lower = self.content.lower()
+        # Match @User Name, @username, or BOT_NAME
+        if f"@{BOT_NAME}" in lower:
+            return True
+        if bot_user_id and f"@{bot_user_id}" in lower:
+            return True
+        return False
+
     def __repr__(self) -> str:
+        parent = f" -> {self.parent_id}" if self.parent_id else ""
         return (
-            f"<OWMessage id={self.id} user={self.user_name} "
-            f"content={self.content[:60]!r}>"
+            f"<OWMessage {self.id}{parent} "
+            f"{self.user_name}:{self.content[:50]!r}>"
         )
 
 
 # ── Adapter ────────────────────────────────────────────────────────────
 
 class OpenWebUIAdapter(BasePlatformAdapter):
-    """
-    Poll-based Open WebUI Channels adapter.
-
-    The bot authenticates as an Open WebUI user, joins a channel,
-    and polls for new messages.  Each human message triggers a run
-    on the Hermes API server; the response is posted to the channel.
-
-    Runs are processed as background tasks so the poll loop isn't
-    blocked by long-running agent turns or approval stalls.
-    """
 
     def __init__(self, config: PlatformConfig, **kwargs):
         platform = Platform("openwebui")
@@ -130,12 +145,7 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.poll_interval = DEFAULT_POLL_INTERVAL
 
-        # Resolution: how to connect to Hermes
-        # "api_server" (default) — uses the running API server on 8642
-        # "direct" — creates AIAgent directly (needs gateway runtime)
-        self.mode: str = extra.get("mode", "api_server")
-
-        # Hermes API server URL (only used in api_server mode)
+        # Hermes API server
         self.hermes_api_url: str = (
             os.getenv("HERMES_API_URL")
             or extra.get("hermes_api_url", "http://127.0.0.1:8642/v1")
@@ -147,10 +157,14 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         # Runtime state
         self._channel_id: Optional[str] = None
         self._bot_user_id: Optional[str] = None
+        self._bot_user_name: str = ""
         self._poll_task: Optional[asyncio.Task] = None
         self._http: Optional[aiohttp.ClientSession] = None
-        self._channels: Dict[str, ChannelState] = {}
-        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Thread state: thread_parent_id → ThreadState
+        self._threads: Dict[str, ThreadState] = {}
+        # Channel watermark: last-seen message ID
+        self._last_seen: Optional[str] = None
 
         self.home_channel: str = (
             os.getenv("OPENWEBUI_HOME_CHANNEL") or self.channel_name
@@ -160,9 +174,9 @@ class OpenWebUIAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Open WebUI"
 
-    # ── HTTP helpers ──
+    # ── HTTP ──
 
-    def _headers(self) -> dict:
+    def _ow_headers(self) -> dict:
         return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -175,39 +189,33 @@ class OpenWebUIAdapter(BasePlatformAdapter):
             h["Authorization"] = f"Bearer {self.hermes_api_key}"
         return h
 
-    def _api(self, path: str) -> str:
+    def _api_url(self, path: str) -> str:
         return f"{self.base_url}/api{path}"
 
     async def _ow_get(self, path: str) -> Any:
         async with self._http.get(
-            self._api(path), headers=self._headers()
+            self._api_url(path), headers=self._ow_headers()
         ) as r:
             if r.status >= 400:
                 text = await r.text()
-                logger.error("OW GET %s → %s: %s", path, r.status, text[:200])
+                logger.error("GET %s → %s: %s", path, r.status, text[:200])
                 return None
             return await r.json()
 
     async def _ow_post(self, path: str, body: dict = None) -> Any:
         async with self._http.post(
-            self._api(path), headers=self._headers(), json=body or {}
+            self._api_url(path), headers=self._ow_headers(), json=body or {}
         ) as r:
             if r.status >= 400:
                 text = await r.text()
-                logger.error("OW POST %s → %s: %s", path, r.status, text[:200])
+                logger.error("POST %s → %s: %s", path, r.status, text[:200])
                 return None
             return await r.json()
-
-    async def _ow_post_raw(self, path: str, body: dict = None) -> aiohttp.ClientResponse:
-        return await self._http.post(
-            self._api(path), headers=self._headers(), json=body or {}
-        )
 
     # ── Lifecycle ──
 
     async def connect(self) -> bool:
         if not self.base_url or not self.api_key or not self.channel_name:
-            logger.error("Open WebUI: missing url, api_key, or channel")
             self._set_fatal_error(
                 "config_missing",
                 "OPENWEBUI_URL, OPENWEBUI_API_KEY, OPENWEBUI_CHANNEL_NAME required",
@@ -216,40 +224,33 @@ class OpenWebUIAdapter(BasePlatformAdapter):
             return False
 
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(60))
-        self._event_loop = asyncio.get_running_loop()
 
-        # Auth
+        # Authenticate
         me = await self._ow_get("/auth/")
-        if me is None:
-            logger.error("Open WebUI: auth failed")
+        if not isinstance(me, dict):
             self._set_fatal_error("auth_failed", "Check API key", retryable=True)
             await self._http.close()
             self._http = None
             return False
-        self._bot_user_id = me.get("id") if isinstance(me, dict) else None
-        logger.info("Open WebUI: authenticated as user %s", self._bot_user_id)
+        self._bot_user_id = me.get("id", "")
+        self._bot_user_name = me.get("name", "").lower()
+        logger.info("Open WebUI: authed as %s (%s)", me.get("name"), self._bot_user_id)
 
         # Resolve channel
         self._channel_id = await self._resolve_channel()
         if not self._channel_id:
-            logger.error("Open WebUI: channel %r not found", self.channel_name)
             self._set_fatal_error(
-                "channel_not_found",
-                f"Channel {self.channel_name!r} not found",
+                "channel_not_found", f"Channel {self.channel_name!r} not found",
                 retryable=True,
             )
             await self._http.close()
             self._http = None
             return False
-
-        # Initialize channel state
-        self._channels[self._channel_id] = ChannelState()
+        logger.info("Open WebUI: channel %s = %s", self.channel_name, self._channel_id)
 
         # Catch up to latest message
         try:
-            msgs = await self._ow_get(
-                f"/channels/{self._channel_id}/messages?limit=5"
-            )
+            msgs = await self._ow_get(f"/channels/{self._channel_id}/messages?limit=5")
             if isinstance(msgs, list) and msgs:
                 latest = max(
                     (OWMessage(m) for m in msgs),
@@ -257,33 +258,26 @@ class OpenWebUIAdapter(BasePlatformAdapter):
                     default=None,
                 )
                 if latest:
-                    self._channels[self._channel_id].last_message_id = latest.id
+                    self._last_seen = latest.id
         except Exception as e:
-            logger.warning("Open WebUI: initial fetch: %s", e)
+            logger.warning("initial catch-up: %s", e)
 
-        # Start polling
         self._poll_task = asyncio.create_task(self._poll_loop())
-
         self._mark_connected()
-        logger.info(
-            "Open WebUI: connected to %s channel %s (%s)",
-            self.base_url, self.channel_name, self._channel_id,
-        )
         return True
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
-        if self._poll_task is not None:
+        if self._poll_task:
             self._poll_task.cancel()
             try:
                 await self._poll_task
             except (asyncio.CancelledError, Exception):
                 pass
             self._poll_task = None
-        if self._http is not None:
+        if self._http:
             await self._http.close()
             self._http = None
-        logger.info("Open WebUI: disconnected")
 
     async def _resolve_channel(self) -> Optional[str]:
         name = self.channel_name.strip()
@@ -311,25 +305,22 @@ class OpenWebUIAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Open WebUI: poll error: %s", e, exc_info=True)
+                logger.error("poll error: %s", e, exc_info=True)
             await asyncio.sleep(self.poll_interval)
 
     async def _poll_once(self) -> None:
-        ch_state = self._channels.get(self._channel_id)
-        if not ch_state:
-            return
-
+        """Fetch new messages and dispatch to the right thread."""
         msgs = await self._ow_get(
-            f"/channels/{self._channel_id}/messages?limit=10"
+            f"/channels/{self._channel_id}/messages?limit=20"
         )
         if not isinstance(msgs, list):
             return
 
         for raw in msgs:
             msg = OWMessage(raw)
-            if ch_state.last_message_id and msg.id <= ch_state.last_message_id:
+            if self._last_seen and msg.id <= self._last_seen:
                 continue
-            ch_state.last_message_id = msg.id
+            self._last_seen = msg.id
 
             # Skip own messages
             if self._bot_user_id and msg.user_id == self._bot_user_id:
@@ -339,94 +330,122 @@ class OpenWebUIAdapter(BasePlatformAdapter):
             if not content:
                 continue
 
-            logger.info("Open WebUI: %s: %s", msg.user_name, content[:80])
+            # ── Determine which thread this belongs to ──
+            if msg.is_top_level():
+                # Top-level message → check for @mention to start a thread
+                if not msg.mentions_bot(self._bot_user_id):
+                    continue  # ignore unaddressed top-level messages
+                # This starts a new thread. parent_id = this message
+                thread_id = msg.id
+                logger.info("new thread %s from %s", thread_id, msg.user_name)
+            else:
+                # Reply in an existing thread
+                thread_id = msg.parent_id
+                logger.debug("thread reply %s in %s", msg.id, thread_id)
 
-            # Dispatch as background task so polling continues
+            # Dispatch to background task
             asyncio.create_task(
-                self._process_message(content, msg, self._channel_id, ch_state)
+                self._handle_message(content, msg, thread_id)
             )
 
-    # ── Approval helpers ──
+    # ── Message handling ──
+
+    async def _handle_message(
+        self, content: str, msg: OWMessage, thread_id: str
+    ) -> None:
+        """Process one message in its thread context."""
+        thread = self._get_or_create_thread(thread_id)
+
+        # ── Approval response? ──
+        if thread.pending_run_id:
+            choice = self._parse_approval_choice(content)
+            if choice:
+                await self._resolve_approval(thread, choice, thread_id)
+                return
+
+        # ── Normal message ──
+        thread.add_user_message(content)
+        await self._run_hermes(thread, content, thread_id)
+
+    def _get_or_create_thread(self, thread_id: str) -> ThreadState:
+        if thread_id not in self._threads:
+            self._threads[thread_id] = ThreadState(thread_id)
+        return self._threads[thread_id]
+
+    # ── Approval ──
 
     APPROVE_WORDS = frozenset({"approve", "approved", "yes", "allow", "once"})
     DENY_WORDS = frozenset({"deny", "denied", "no", "reject"})
 
-    def _session_key(self, channel_id: str) -> str:
-        return f"owui:{channel_id}"
-
-    def _is_approval_response(self, text: str, ch_state: ChannelState) -> bool:
-        if not ch_state.pending_run_id or not ch_state.pending_session_key:
-            return False
-        cleaned = text.strip().lower().rstrip(".!").strip()
-        return cleaned in self.APPROVE_WORDS or cleaned in self.DENY_WORDS
-
-    def _map_approval_choice(self, text: str) -> str:
+    def _parse_approval_choice(self, text: str) -> Optional[str]:
         cleaned = text.strip().lower().rstrip(".!").strip()
         if cleaned in self.DENY_WORDS:
             return "deny"
-        if cleaned in {"always"}:
+        if cleaned == "always":
             return "always"
-        if cleaned in {"session"}:
+        if cleaned == "session":
             return "session"
-        return "once"
+        if cleaned in self.APPROVE_WORDS:
+            return "once"
+        return None
 
-    # ── Message processing via API server ──
-
-    async def _process_message(
-        self,
-        text: str,
-        msg: OWMessage,
-        channel_id: str,
-        ch_state: ChannelState,
+    async def _resolve_approval(
+        self, thread: ThreadState, choice: str, thread_id: str
     ) -> None:
-        """Run the message through Hermes and post the response."""
-
-        # ── If this is an approval response, resolve it ──
-        if self._is_approval_response(text, ch_state):
-            choice = self._map_approval_choice(text)
-            run_id = ch_state.pending_run_id
-            try:
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(30)
-                ) as s:
-                    async with s.post(
-                        f"{self.hermes_api_url}/runs/{run_id}/approval",
-                        headers=self._hermes_headers(),
-                        json={"choice": choice},
-                    ) as r:
-                        if r.status < 400:
-                            await self._post_message(
-                                channel_id, f"✅ **{choice}** — continuing…"
-                            )
-                            ch_state.pending_run_id = None
-                            ch_state.pending_session_key = None
-                            return
-            except Exception as e:
-                logger.error("Approval error: %s", e)
+        run_id = thread.pending_run_id
+        if not run_id:
             return
+        session_key = thread.pending_session_key
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(30)) as s:
+                async with s.post(
+                    f"{self.hermes_api_url}/runs/{run_id}/approval",
+                    headers=self._hermes_headers(),
+                    json={"choice": choice},
+                ) as r:
+                    if r.status < 400:
+                        await self._post_thread_reply(
+                            thread_id, f"✅ **{choice}** — continuing…"
+                        )
+                    else:
+                        await self._post_thread_reply(
+                            thread_id, "⚠️ Approval submission failed."
+                        )
+        except Exception as e:
+            logger.error("approval error: %s", e)
+        thread.pending_run_id = None
+        thread.pending_session_key = None
 
-        # ── Normal message: submit to Hermes API server ──
-        session_id = self._session_key(channel_id)
-        ch_state.add_user_message(text)
+    # ── Hermes execution ──
 
-        # Start run
+    def _session_key(self, thread_id: str) -> str:
+        return f"owui:{self._channel_id}:{thread_id}"
+
+    async def _run_hermes(
+        self, thread: ThreadState, message: str, thread_id: str
+    ) -> None:
+        """Submit a message to Hermes via /v1/runs and post the response."""
+        session_id = self._session_key(thread_id)
+
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(600)
-            ) as hermes_http:
-                async with hermes_http.post(
+            ) as hermes:
+
+                # Start run
+                async with hermes.post(
                     f"{self.hermes_api_url}/runs",
                     headers=self._hermes_headers(),
                     json={
-                        "input": text,
-                        "conversation_history": list(ch_state.history[:-1]),
+                        "input": message,
+                        "conversation_history": list(thread.history[:-1]),
                         "session_id": session_id,
                     },
                 ) as r:
                     if r.status >= 400:
                         err_body = await r.text()
-                        await self._post_message(
-                            channel_id,
+                        await self._post_thread_reply(
+                            thread_id,
                             f"⚠️ **Hermes error** ({r.status}): {err_body[:300]}",
                         )
                         return
@@ -435,9 +454,7 @@ class OpenWebUIAdapter(BasePlatformAdapter):
 
                 # Consume SSE events
                 accumulated = ""
-                approval_prompt = None
-
-                async with hermes_http.get(
+                async with hermes.get(
                     f"{self.hermes_api_url}/runs/{run_id}/events",
                     headers=self._hermes_headers(),
                 ) as sse:
@@ -453,7 +470,6 @@ class OpenWebUIAdapter(BasePlatformAdapter):
                                 event = json.loads(line[6:])
                             except json.JSONDecodeError:
                                 continue
-
                             ev = event.get("event", "")
 
                             if ev == "message.delta":
@@ -462,82 +478,73 @@ class OpenWebUIAdapter(BasePlatformAdapter):
                                     accumulated += d
 
                             elif ev == "approval.request":
-                                approval_prompt = event.get(
-                                    "message",
-                                    event.get("preview", "Approve this?"),
+                                prompt = event.get("message", event.get("preview", "Approve?"))
+                                thread.pending_run_id = run_id
+                                thread.pending_session_key = session_id
+                                await self._post_thread_reply(
+                                    thread_id,
+                                    f"⚠️ **Approval Required**\n```\n{prompt[:500]}\n```\n"
+                                    f"Reply **`approve`** or **`deny`**.",
                                 )
-                                ch_state.pending_run_id = run_id
-                                ch_state.pending_session_key = session_id
-
-                                # Can't wait here — emit the prompt and return.
-                                # The user's response will hit _is_approval_response
-                                # on the next poll cycle.
-                                await self._post_message(
-                                    channel_id,
-                                    f"⚠️ **Approval Required**\n```\n{approval_prompt[:500]}\n```\n"
-                                    f"Reply with **`approve`** or **`deny`**.",
-                                )
-                                return  # SSE connection drops, but run is still alive.
-                                # The agent thread blocks until approval is resolved.
+                                return  # agent blocks; next user msg resolves
 
                             elif ev == "run.completed":
                                 output = event.get("output", "")
                                 if output and output not in accumulated:
                                     accumulated = output
                                 if accumulated:
-                                    ch_state.add_assistant_message(accumulated)
-                                    await self._post_message(channel_id, accumulated)
+                                    thread.add_assistant_message(accumulated)
+                                    await self._post_thread_reply(thread_id, accumulated)
                                 else:
-                                    await self._post_message(
-                                        channel_id, "(Hermes returned no response)"
-                                )
+                                    await self._post_thread_reply(
+                                        thread_id, "(no response)"
+                                    )
                                 return
 
                             elif ev == "run.failed":
                                 err = event.get("error", "Unknown error")
-                                await self._post_message(
-                                    channel_id, f"⚠️ **Agent Error:** {err}"
+                                await self._post_thread_reply(
+                                    thread_id, f"⚠️ **Error:** {err}"
                                 )
                                 return
 
                             elif ev == "run.cancelled":
-                                await self._post_message(
-                                    channel_id, "*Run cancelled.*"
+                                await self._post_thread_reply(
+                                    thread_id, "*Cancelled.*"
                                 )
                                 return
 
-                # SSE ended without a terminal event
+                # SSE ended without terminal event
                 if accumulated:
-                    ch_state.add_assistant_message(accumulated)
-                    await self._post_message(channel_id, accumulated)
+                    thread.add_assistant_message(accumulated)
+                    await self._post_thread_reply(thread_id, accumulated)
                 else:
-                    await self._post_message(
-                        channel_id, "(Hermes returned no response)"
-                    )
+                    await self._post_thread_reply(thread_id, "(no response)")
 
         except asyncio.TimeoutError:
-            await self._post_message(
-                channel_id, "⚠️ **Timed out** waiting for Hermes response."
-            )
+            await self._post_thread_reply(thread_id, "⚠️ **Hermes timed out.**")
         except aiohttp.ClientConnectorError:
-            await self._post_message(
-                channel_id,
-                f"⚠️ **Cannot connect** to Hermes API at `{self.hermes_api_url}`.",
+            await self._post_thread_reply(
+                thread_id,
+                f"⚠️ **Cannot connect** to Hermes at `{self.hermes_api_url}`.",
             )
         except Exception as e:
-            logger.exception("Open WebUI: message processing error")
-            await self._post_message(channel_id, f"⚠️ **Error:** {e}")
+            logger.exception("processing error")
+            await self._post_thread_reply(thread_id, f"⚠️ **Error:** {e}")
 
-    # ── Sending (to Open WebUI channel + send_message tool) ──
+    # ── Sending ──
 
-    async def _post_message(self, channel_id: str, text: str) -> None:
-        """Post a message to the Open WebUI channel."""
-        if not self._http:
+    async def _post_thread_reply(self, thread_parent_id: str, text: str) -> None:
+        """
+        Post a reply in a thread.
+
+        The reply is addressed to the thread's parent message.
+        This keeps all Hermes responses in the same thread.
+        """
+        if not self._http or not self._channel_id:
             return
-        await self._ow_post(
-            f"/channels/{channel_id}/messages/post",
-            {"content": text, "data": {"files": []}},
-        )
+        body = {"content": text, "data": {"files": []}, "parent_id": thread_parent_id}
+        await self._ow_post(f"/channels/{self._channel_id}/messages/post", body)
 
     async def send(
         self,
@@ -546,32 +553,53 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """
+        Send a message via the send_message tool or cron delivery.
+
+        chat_id can be:
+        - A thread parent ID (prefixed with "thread:" → reply in that thread)
+        - A channel ID (top-level post)
+        - Empty → uses the home channel as a top-level post
+        """
         target = chat_id or self._channel_id
         if not target:
-            return SendResult(success=False, error="No channel configured")
+            return SendResult(success=False, error="No target configured")
         try:
             body: Dict[str, Any] = {"content": content, "data": {"files": []}}
-            if reply_to:
-                body["reply_to_id"] = reply_to
-            await self._ow_post(f"/channels/{target}/messages/post", body)
+
+            # If target is "thread:PARENT_ID", post as a thread reply
+            if target.startswith("thread:") and self._channel_id:
+                parent_id = target[7:]
+                body["parent_id"] = parent_id
+                await self._ow_post(
+                    f"/channels/{self._channel_id}/messages/post", body
+                )
+            else:
+                await self._ow_post(
+                    f"/channels/{target}/messages/post", body
+                )
             return SendResult(success=True)
         except Exception as e:
-            logger.error("Open WebUI send: %s", e)
+            logger.error("send error: %s", e)
             return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str) -> None:
-        pass
+        pass  # not supported by Open WebUI Channels API
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         if not self._http or not self._channel_id:
             return {"name": "Open WebUI", "type": "channel"}
         ch = await self._ow_get(f"/channels/{chat_id or self._channel_id}")
         if isinstance(ch, dict):
-            return {"name": ch.get("name", "Open WebUI"), "type": "channel", "chat_id": chat_id}
+            return {
+                "name": ch.get("name", "Open WebUI"),
+                "type": "channel",
+                "chat_id": chat_id,
+            }
         return {"name": "Open WebUI", "type": "channel", "chat_id": chat_id}
 
 
-# ── Plugin registration helpers ────────────────────────────────────────
+# ── Plugin registration ────────────────────────────────────────────────
 
 def check_requirements() -> bool:
     try:
@@ -615,18 +643,17 @@ async def interactive_setup(ctx) -> Optional[dict]:
 def _env_enablement() -> Optional[dict]:
     url = os.getenv("OPENWEBUI_URL")
     key = os.getenv("OPENWEBUI_API_KEY")
-    channel = os.getenv("OPENWEBUI_CHANNEL_NAME")
-    if not url and not key and not channel:
+    ch = os.getenv("OPENWEBUI_CHANNEL_NAME")
+    if not url and not key and not ch:
         return None
     extra = {}
     if url:
         extra["url"] = url
     if key:
         extra["api_key"] = key
-    if channel:
-        extra["channel"] = channel
-        extra["home_channel"] = channel
-    # Also pick up optional Hermes API config
+    if ch:
+        extra["channel"] = ch
+        extra["home_channel"] = ch
     if os.getenv("HERMES_API_URL"):
         extra["hermes_api_url"] = os.getenv("HERMES_API_URL")
     if os.getenv("HERMES_API_KEY"):
@@ -649,28 +676,27 @@ async def _standalone_send(config: dict, chat_id: str, text: str, reply_to: str 
         async with session.get(f"{base_url}/api/channels/", headers=headers) as r:
             if r.status >= 400:
                 return {"success": False, "error": await r.text()}
-            channels = await r.json()
+            chans = await r.json()
         ch_id = None
         search = target.lstrip("#").lower()
-        if isinstance(channels, list):
-            for ch in channels:
+        if isinstance(chans, list):
+            for ch in chans:
                 if str(ch.get("name", "")).strip().lower() == search:
                     ch_id = ch.get("id")
                     break
         if not ch_id:
             return {"success": False, "error": f"Channel {target!r} not found"}
+        body = {"content": text, "data": {"files": []}}
+        if reply_to:
+            body["parent_id"] = reply_to
         async with session.post(
             f"{base_url}/api/channels/{ch_id}/messages/post",
-            headers=headers,
-            json={"content": text, "data": {"files": []}},
+            headers=headers, json=body,
         ) as r:
-            if r.status >= 400:
-                return {"success": False, "error": await r.text()}
-            return {"success": True}
+            return {"success": r.status < 400, "error": await r.text() if r.status >= 400 else ""}
 
 
 def register(ctx):
-    """Register the Open WebUI platform with Hermes."""
     ctx.register_platform(
         name="openwebui",
         label="Open WebUI",
@@ -689,10 +715,10 @@ def register(ctx):
         allow_update_command=True,
         platform_hint=(
             "You are chatting via Open WebUI Channels. "
-            "Open WebUI supports markdown formatting in messages. "
-            "Each message is independent — users can interject with "
-            "new messages while you're processing. "
-            "For approvals, describe the operation and tell the user "
-            "to reply with 'approve' or 'deny'."
+            "You operate in message threads.  Each thread is one "
+            "conversation — users @mention you to start a new thread. "
+            "Once a thread exists, users can reply without @mentioning. "
+            "For approvals, describe the operation and the user can "
+            "reply with 'approve' or 'deny' in the same thread."
         ),
     )
