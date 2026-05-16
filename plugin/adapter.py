@@ -98,6 +98,7 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         self._bot_user_id: Optional[str] = None
         self._bot_user_name: str = ""
         self._channel_id: Optional[str] = None
+        self._jwt_token: str = ""
 
         # Socket.IO
         self._sio: Optional[socketio.AsyncClient] = None
@@ -151,10 +152,13 @@ class OpenWebUIAdapter(BasePlatformAdapter):
 
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(30))
 
-        # Auth check
+        # ── Auth: verify API key AND get JWT for Socket.IO ──
         me = await self._ow_get("/api/v1/auths/")
         if not isinstance(me, dict) or not me.get("id"):
-            logger.error("Open WebUI: auth failed at %s/api/v1/auths/", self.base_url)
+            logger.error(
+                "Open WebUI: auth failed at %s/api/v1/auths/",
+                self.base_url,
+            )
             self._set_fatal_error("auth_failed", "Check API key", retryable=True)
             await self._http.close()
             self._http = None
@@ -162,7 +166,39 @@ class OpenWebUIAdapter(BasePlatformAdapter):
 
         self._bot_user_id = me.get("id", "")
         self._bot_user_name = (me.get("name") or "").lower()
-        logger.info("Open WebUI: authed as %s (id=%s)", me.get("name"), self._bot_user_id)
+        logger.info(
+            "Open WebUI: authed as %s (id=%s)",
+            me.get("name"), self._bot_user_id,
+        )
+
+        # Get a JWT for Socket.IO — API keys don't work with decode_token
+        self._jwt_token = os.getenv("OPENWEBUI_JWT_TOKEN") or extra.get("jwt_token", "")
+        if not self._jwt_token:
+            email = os.getenv("OPENWEBUI_EMAIL") or extra.get("email", "")
+            password = os.getenv("OPENWEBUI_PASSWORD") or extra.get("password", "")
+            if email and password:
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(30)
+                    ) as s:
+                        async with s.post(
+                            f"{self.base_url}/api/v1/auths/signin",
+                            json={"email": email, "password": password},
+                        ) as r:
+                            if r.status < 400:
+                                jwt_data = await r.json()
+                                if jwt_data.get("token"):
+                                    self._jwt_token = jwt_data["token"]
+                                    logger.info("Open WebUI: got JWT for Socket.IO")
+                except Exception as e:
+                    logger.warning("Open WebUI: JWT signin failed: %s", e)
+
+        if not self._jwt_token:
+            logger.warning(
+                "Open WebUI: no JWT available — Socket.IO channel events "
+                "will not work. Set OPENWEBUI_JWT_TOKEN (from browser cookies) "
+                "or OPENWEBUI_EMAIL + OPENWEBUI_PASSWORD."
+            )
 
         # Resolve channel ID from name
         ch_id = await self._resolve_channel_id_by_api(me.get("id"))
@@ -175,7 +211,7 @@ class OpenWebUIAdapter(BasePlatformAdapter):
                 self.channel_name,
             )
 
-        # Connect Socket.IO
+        # Connect Socket.IO with JWT token (API keys don't work with Socket.IO auth)
         self._sio = socketio.AsyncClient(logger=False, engineio_logger=False)
         self._register_handlers()
 
@@ -184,7 +220,7 @@ class OpenWebUIAdapter(BasePlatformAdapter):
                 self.base_url,
                 socketio_path="/ws/socket.io",
                 transports=["websocket"],
-                auth={"token": self.api_key},
+                auth={"token": self._jwt_token},
             )
             logger.info("Open WebUI: Socket.IO connected")
         except Exception as e:
@@ -196,17 +232,26 @@ class OpenWebUIAdapter(BasePlatformAdapter):
 
         # Join channels — register channel handlers AFTER auth
         async def join_callback(*args):
-            uid = args[0].get("id") if args else None
+            uid = args[0].get("id") if args and isinstance(args[0], dict) else self._bot_user_id
             if uid:
                 self._register_channel_handlers(uid)
             logger.info(
                 "Open WebUI: joined channels (user=%s)",
                 uid or "unknown",
             )
+            # Send a test message to verify the socket path works
+            if self._channel_id and uid:
+                await self._sio.emit("channel-message", {
+                    "channel_id": self._channel_id,
+                    "data": {
+                        "content": "🤖 Hermes online! Listening for @hermes...",
+                        "data": {"files": []},
+                    },
+                })
 
         await self._sio.emit(
             "user-join",
-            {"auth": {"token": self.api_key}},
+            {"auth": {"token": self._jwt_token}},
             callback=join_callback,
         )
 
@@ -259,11 +304,10 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         async def on_disconnect():
             logger.info("Open WebUI: socket disconnected")
 
-        # Catch-all: log every event name for debugging
+        # Catch-all: log ALL events to diagnose what the server sends
         @sio.on("*")
         async def catch_all(event: str, *args):
-            if event not in ("connect", "disconnect", "connect_error"):
-                logger.info("Open WebUI socket event: %s", event)
+            logger.info("Open WebUI SOCKET EVENT: %s args=%s", event, str(args)[:300])
 
     def _register_channel_handlers(self, user_id: str) -> None:
         """
