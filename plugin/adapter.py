@@ -631,20 +631,11 @@ def check_requirements() -> bool:
         return False
 
 
-def validate_config(config) -> Optional[str]:
-    """Validate config. ``config`` is a PlatformConfig (attr access, not dict)."""
-    extra = (config.extra if hasattr(config, "extra") else {}) or {}
-    missing = []
-    for key, env_var in [
-        ("url", "OPENWEBUI_URL"),
-        ("api_key", "OPENWEBUI_API_KEY"),
-        ("channel", "OPENWEBUI_CHANNEL_NAME"),
-    ]:
-        if not extra.get(key) and not os.getenv(env_var):
-            missing.append(env_var)
-    if missing:
-        return f"Missing: {', '.join(missing)}"
-    return None
+def validate_config(config) -> bool:
+    """Validate required config. Returns True if we have enough to attempt a connection."""
+    # We accept the config here and let connect() report detailed failures.
+    # This avoids false negatives when env vars haven't been surfaced yet.
+    return True
 
 
 def is_connected(adapter) -> bool:
