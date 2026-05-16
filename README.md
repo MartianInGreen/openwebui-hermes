@@ -28,9 +28,9 @@ so you can interject mid-response.
 3. **Set env vars** or add to `~/.hermes/config.yaml`:
 
 ```bash
-export OPENWEBUI_URL=http://your-tailscale-address:3000
-export OPENWEBUI_API_KEY=sk-your-api-key-here
-export OPENWEBUI_CHANNEL_NAME=#hermes
+OPENWEBUI_URL=http://your-tailscale-address:3000
+OPENWEBUI_API_KEY=sk-your-api-key-here
+OPENWEBUI_CHANNEL_NAME=#hermes
 ```
 
 4. **Restart the gateway**:
