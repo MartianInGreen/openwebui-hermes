@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -225,16 +226,32 @@ class OpenWebUIAdapter(BasePlatformAdapter):
 
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(60))
 
-        # Authenticate
-        me = await self._ow_get("/auth/")
-        if not isinstance(me, dict):
-            self._set_fatal_error("auth_failed", "Check API key", retryable=True)
+        # ── Auth: try known endpoints ──
+        me = None
+        for auth_path in ("/v1/auths/", "/auths/", "/v1/auth/"):
+            me = await self._ow_get(auth_path)
+            if isinstance(me, dict) and me.get("id"):
+                logger.info("auth endpoint found: %s", auth_path)
+                break
+
+        if not isinstance(me, dict) or not me.get("id"):
+            logger.error(
+                "Open WebUI: auth failed — tried /v1/auths/, /auths/, /v1/auth/.\n"
+                "  Check that your API key is valid and has permissions.\n"
+                "  URL: %s\n  Key starts with: %s...",
+                self.base_url, self.api_key[:12] if len(self.api_key) > 12 else "(empty)",
+            )
+            self._set_fatal_error("auth_failed", "Cannot auth. Check API key.", retryable=True)
             await self._http.close()
             self._http = None
             return False
+
         self._bot_user_id = me.get("id", "")
-        self._bot_user_name = me.get("name", "").lower()
-        logger.info("Open WebUI: authed as %s (%s)", me.get("name"), self._bot_user_id)
+        self._bot_user_name = (me.get("name") or "").lower()
+        logger.info(
+            "Open WebUI: authed as %r (id=%s name=%s)",
+            me.get("name"), self._bot_user_id, self._bot_user_name,
+        )
 
         # Resolve channel
         self._channel_id = await self._resolve_channel()
@@ -282,10 +299,15 @@ class OpenWebUIAdapter(BasePlatformAdapter):
     async def _resolve_channel(self) -> Optional[str]:
         name = self.channel_name.strip()
         if name.startswith("ch_"):
-            ch = await self._ow_get(f"/channels/{name}")
-            if isinstance(ch, dict) and ch.get("id"):
-                return ch["id"]
-        channels = await self._ow_get("/channels/")
+            for prefix in ("/api/v1/channels/", "/api/channels/"):
+                ch = await self._ow_get(f"{prefix}{name}")
+                if isinstance(ch, dict) and ch.get("id"):
+                    return ch["id"]
+        # List channels — try both path variants
+        for prefix in ("/api/v1/channels", "/api/channels/"):
+            channels = await self._ow_get(prefix)
+            if isinstance(channels, list):
+                break
         if not isinstance(channels, list):
             return None
         search = name.lstrip("#").lower()
@@ -609,8 +631,9 @@ def check_requirements() -> bool:
         return False
 
 
-def validate_config(config: dict) -> Optional[str]:
-    extra = config.get("extra", {}) or {}
+def validate_config(config) -> Optional[str]:
+    """Validate config. ``config`` is a PlatformConfig (attr access, not dict)."""
+    extra = (config.extra if hasattr(config, "extra") else {}) or {}
     missing = []
     for key, env_var in [
         ("url", "OPENWEBUI_URL"),
@@ -661,8 +684,8 @@ def _env_enablement() -> Optional[dict]:
     return extra
 
 
-async def _standalone_send(config: dict, chat_id: str, text: str, reply_to: str = None) -> dict:
-    extra = config.get("extra", {}) or {}
+async def _standalone_send(config, chat_id: str, text: str, reply_to: str = None) -> dict:
+    extra = (getattr(config, "extra", {}) if not isinstance(config, dict) else config.get("extra", {})) or {}
     base_url = (extra.get("url") or "").rstrip("/")
     api_key = extra.get("api_key") or ""
     target = chat_id or extra.get("channel", "")
